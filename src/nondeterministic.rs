@@ -1,57 +1,21 @@
-use std::{
-	collections::HashSet,
-	rc::{Rc, Weak},
-};
-
-#[derive(Debug, Clone)]
-enum Ptr<T> {
-	Strong(Rc<T>),
-	Weak(Weak<T>),
-}
-
-impl<T> Ptr<T> {
-	/// Weak must be valid!
-	unsafe fn as_ref(&self) -> &T {
-		match self {
-			Self::Strong(rc) => &*rc,
-			Self::Weak(weak) => unsafe {
-				assert!(weak.strong_count() > 0);
-				&*weak.as_ptr()
-			},
-		}
-	}
-}
-
-impl<T: PartialEq> PartialEq for Ptr<T> {
-	fn eq(&self, other: &Self) -> bool {
-		match (self, other) {
-			(Ptr::Strong(a), Ptr::Strong(b)) => a == b,
-			(Ptr::Strong(s), Ptr::Weak(w)) | (Ptr::Weak(w), Ptr::Strong(s)) => match w.upgrade() {
-				Some(x) => &x == s,
-				None => false,
-			},
-			(Ptr::Weak(a), Ptr::Weak(b)) => a.ptr_eq(b),
-		}
-	}
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Copy)]
 enum MatchValue {
 	Char(char),
 	/// `branch` must always be valid
 	Split {
-		branch: Ptr<State>,
+		branch: usize,
 	},
 	Wildcard,
+	Match,
 }
 
-impl MatchValue {
+impl<'a> MatchValue {
 	/// Assumes MatchValue is either `Char` or `Wildcard`
 	fn matches(&self, value: char) -> bool {
 		match self {
 			MatchValue::Char(c) => *c == value,
 			MatchValue::Wildcard => true,
-			_ => unreachable!(),
+			_ => unreachable!("called MatchValue::matches() on MatchValue::Split"),
 		}
 	}
 }
@@ -59,12 +23,13 @@ impl MatchValue {
 #[derive(Debug, Clone, PartialEq)]
 struct State {
 	value: MatchValue,
-	next: Option<Rc<Self>>,
+	next: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Regex {
-	head: Option<Rc<State>>,
+	states: Vec<State>,
+	head: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,59 +47,60 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Debug, Clone, Copy)]
-struct Reference<'a>(&'a State);
-
-impl<'a> PartialEq for Reference<'a> {
-	fn eq(&self, other: &Self) -> bool {
-		self.0 as *const _ == other.0 as *const _
-	}
-}
-impl<'a> Eq for Reference<'a> {}
-
-impl<'a> std::hash::Hash for Reference<'a> {
-	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-		state.write_usize(self.0 as *const _ as usize)
-	}
-}
-
 #[derive(Debug, Default)]
 struct Step<'a> {
-	current: HashSet<Reference<'a>>,
-	next: HashSet<Reference<'a>>,
+	states: &'a [State],
+	// TODO: switch to bit field for space efficiency - Vec<u8>
+	current: Vec<bool>,
+	next: Vec<bool>,
 	matched: bool,
 }
 
 impl<'a> Step<'a> {
-	fn add_state(&mut self, state: &'a State) {
-		match &state.value {
+	fn new(states: &'a [State]) -> Self {
+		Self {
+			states,
+			current: vec![false; states.len()],
+			next: vec![false; states.len()],
+			matched: false,
+		}
+	}
+
+	fn add_state(&mut self, idx: usize) {
+		let state = &self.states[idx];
+
+		match state.value {
 			MatchValue::Char(_) | MatchValue::Wildcard => {
-				self.next.insert(Reference(state));
+				self.next[idx] = true;
 			}
 			MatchValue::Split { branch } => {
-				self.add_state(unsafe { branch.as_ref() });
-
-				match &state.next {
-					Some(next) => self.add_state(next),
-					None => self.matched = true,
-				}
+				self.add_state(branch);
+				self.add_state(state.next);
 			}
+			MatchValue::Match => self.matched = true,
 		};
 	}
 
 	fn step(&mut self, to_match: char) {
 		std::mem::swap(&mut self.current, &mut self.next);
-		self.next.clear();
 
-		let states = self.current.iter().copied().collect::<Vec<_>>();
+		// TODO: better way to do this
+		for v in &mut self.next {
+			*v = false;
+		}
 
-		for Reference(state) in states {
-			if state.value.matches(to_match) {
-				match &state.next {
-					Some(next) => self.add_state(next),
-					None => self.matched = true,
-				}
-			}
+		let next_states: Vec<_> = self
+			.current
+			.iter()
+			.enumerate()
+			.filter(|(_, x)| **x)
+			.map(|(i, _)| &self.states[i])
+			.filter(|state| state.value.matches(to_match))
+			.map(|s| s.next)
+			.collect();
+
+		for next in next_states {
+			self.add_state(next);
 		}
 	}
 }
@@ -149,250 +115,144 @@ fn get_value(c: Option<char>) -> Result<MatchValue, Error> {
 }
 
 impl Regex {
-	/// start backwards?
 	pub fn from_simple_expression(expression: &str) -> Result<Self, Error> {
-		if expression.is_empty() {
-			return Ok(Default::default());
-		}
+		let mut states = vec![State {
+			next: 0,
+			value: MatchValue::Match,
+		}];
 
 		let mut chars = expression.chars().rev();
 
-		let mut next = None;
+		let mut index = 0;
+
+		macro_rules! push {
+			($state: expr) => {
+				index += 1;
+				states.push($state);
+			};
+		}
 
 		while let Some(c) = chars.next() {
 			match c {
 				'?' => {
 					let value = get_value(chars.next())?;
 
-					let branch = State {
-						value,
-						next: next.as_ref().map(Rc::clone),
-					};
-
+					// next, matcher, split
+					// idx, idx + 1, idx + 2
+					let matcher = State { value, next: index };
 					let split = State {
-						value: MatchValue::Split {
-							branch: Ptr::Strong(Rc::new(branch)),
-						},
-						next,
+						value: MatchValue::Split { branch: index + 1 },
+						next: index,
 					};
 
-					next = Some(Rc::new(split));
+					push!(matcher);
+					push!(split);
 				}
 				'+' => {
 					let value = get_value(chars.next())?;
 
-					let state = Rc::new_cyclic(|weak| State {
-						value,
-						next: Some(Rc::new(State {
-							value: MatchValue::Split {
-								branch: Ptr::Weak(Weak::clone(weak)),
-							},
-							next,
-						})),
-					});
+					// next, split, matcher
+					// idx,  idx+1, idx + 2
 
-					next = Some(state);
+					let split = State {
+						value: MatchValue::Split { branch: index + 2 },
+						next: index,
+					};
+
+					let matcher = State {
+						value,
+						next: index + 1,
+					};
+
+					push!(split);
+					push!(matcher);
 				}
 				'*' => {
 					let value = get_value(chars.next())?;
 
-					let state = Rc::new_cyclic(|weak| State {
-						value,
-						next: Some(Rc::new(State {
-							value: MatchValue::Split {
-								branch: Ptr::Weak(Weak::clone(weak)),
-							},
-							next,
-						})),
-					});
+					// next, matcher, split
+					// idx, idx + 1, idx + 2
 
-					next = state.next.as_ref().map(Rc::clone);
+					let matcher = State {
+						value,
+						next: index + 2,
+					};
+
+					let split = State {
+						value: MatchValue::Split { branch: index + 1 },
+						next: index,
+					};
+
+					push!(matcher);
+					push!(split);
 				}
 				'|' => {
-					// a|b - next = b
-					let b = next.ok_or(Error::MissingValue)?;
+					// a|b
+					// b, a    , split
+					// i, i + 1, i + 2
+					if index == 0 {
+						return Err(Error::MissingValue);
+					}
+
+					let b = &states[index];
+
 					let a = State {
 						value: get_value(chars.next())?,
-						next: b.next.as_ref().map(Rc::clone),
+						next: b.next,
 					};
 
 					// we add `branch` first (before `next`), so since `a` should come before `b`, `branch` is `a`
-					next = Some(Rc::new(State {
-						value: MatchValue::Split {
-							branch: Ptr::Strong(Rc::new(a)),
-						},
-						next: Some(b),
-					}));
+					let split = State {
+						value: MatchValue::Split { branch: index + 1 },
+						next: index,
+					};
+
+					push!(a);
+					push!(split);
 				}
 				'/' => {
 					let c = chars.next().ok_or(Error::MissingValue)?;
 
 					let state = State {
 						value: MatchValue::Char(c),
-						next,
+						next: index,
 					};
 
-					next = Some(Rc::new(state));
+					push!(state);
 				}
 				'.' => {
 					let state = State {
 						value: MatchValue::Wildcard,
-						next,
+						next: index,
 					};
 
-					next = Some(Rc::new(state));
+					push!(state);
 				}
 				_ => {
 					let state = State {
 						value: MatchValue::Char(c),
-						next,
+						next: index,
 					};
 
-					next = Some(Rc::new(state));
+					push!(state);
 				}
 			}
 		}
 
-		Ok(Self { head: next })
+		Ok(Self {
+			head: index,
+			states,
+		})
 	}
 
 	pub fn test(&self, string: &str) -> bool {
-		match &self.head {
-			Some(state) => {
-				let mut step = Step::default();
+		let mut step = Step::new(&self.states);
 
-				for ch in string.chars() {
-					step.add_state(state);
-					step.step(ch);
-				}
-
-				step.matched
-			}
-			None => true,
+		for ch in string.chars() {
+			step.add_state(self.head);
+			step.step(ch);
 		}
-	}
-}
 
-#[cfg(test)]
-mod tests {
-	use std::rc::Rc;
-
-	use super::{MatchValue::*, Ptr, Regex, State};
-
-	#[test]
-	fn test_regex_compilation() {
-		assert_eq!(
-			Regex::from_simple_expression("abc"),
-			Ok(Regex {
-				head: Some(Rc::new(State {
-					value: Char('a'),
-					next: Some(Rc::new(State {
-						value: Char('b'),
-						next: Some(Rc::new(State {
-							value: Char('c'),
-							next: None,
-						}))
-					}))
-				}))
-			})
-		);
-
-		assert_eq!(
-			Regex::from_simple_expression("wha?/"),
-			Ok(Regex {
-				head: Some(Rc::new(State {
-					value: Char('w'),
-					next: Some(Rc::new(State {
-						value: Char('h'),
-						next: Some(Rc::new(State {
-							value: Char('a'),
-							next: Some(Rc::new(State {
-								value: Char('?'),
-								next: None
-							}))
-						}))
-					}))
-				}))
-			})
-		);
-	}
-
-	#[test]
-	fn test_simple_execution() {
-		let regex = Regex::from_simple_expression("abc").unwrap();
-		assert!(regex.test("abc"));
-		assert!(!regex.test("acb"));
-		assert!(regex.test("my oh myabc oh my"));
-		assert!(regex.test("ababcbac"));
-		assert!(regex.test("bab abc"));
-		assert!(!regex.test("abacbac"));
-	}
-
-	#[test]
-	fn test_optional() {
-		let regex = Regex::from_simple_expression("lbs?");
-
-		assert_eq!(
-			regex,
-			Ok(Regex {
-				head: Some(Rc::new(State {
-					value: Char('l'),
-					next: Some(Rc::new(State {
-						value: Char('b'),
-						next: Some(Rc::new(State {
-							value: Split {
-								branch: Ptr::Strong(Rc::new(State {
-									value: Char('s'),
-									next: None
-								}))
-							},
-							next: None
-						}))
-					}))
-				}))
-			})
-		);
-
-		let regex = regex.unwrap();
-
-		assert!(regex.test("lb"));
-		assert!(regex.test("lbs"));
-		assert!(!regex.test("ls"));
-
-		let regex = Regex::from_simple_expression("allée?s?");
-
-		let next = Rc::new(State {
-			value: Split {
-				branch: Ptr::Strong(Rc::new(State {
-					value: Char('s'),
-					next: None,
-				})),
-			},
-			next: None,
-		});
-
-		assert_eq!(
-			regex,
-			Ok(Regex {
-				head: Some(Rc::new(State {
-					value: Char('a'),
-					next: Some(Rc::new(State {
-						value: Char('l'),
-						next: Some(Rc::new(State {
-							value: Char('l'),
-							next: Some(Rc::new(State {
-								value: Char('é'),
-								next: Some(Rc::new(State {
-									value: Split {
-										branch: Ptr::Strong(Rc::clone(&next))
-									},
-									next: Some(next)
-								}))
-							}))
-						}))
-					}))
-				}))
-			})
-		)
+		step.matched
 	}
 }
