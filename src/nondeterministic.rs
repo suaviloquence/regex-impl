@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::tokenize::{self, MatchCharacter, Repeat, Token};
+use crate::tokenize::{self, MatchCharacter, Repeat, Token, Tokens};
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 enum MatchValue {
@@ -114,7 +114,7 @@ impl<'a> Step<'a> {
 
 impl Regex {
 	pub fn from_simple_expression(expression: &str) -> tokenize::Result<Self> {
-		Token::tokenize_regex(expression).map(|toks| Self::from_tokens(&toks))
+		Tokens::tokenize_regex(expression).map(Self::from_tokens)
 	}
 
 	fn convert_tokens(tokens: &[Box<Token>], states: &mut Vec<State>, index: &mut usize) {
@@ -150,9 +150,6 @@ impl Regex {
 				}
 				MatchCharacter::String(tokens) => Self::convert_tokens(tokens, states, index),
 				MatchCharacter::Or(_, _) => todo!(),
-				MatchCharacter::Beginning | MatchCharacter::End => {
-					unreachable!("Regex boundary in convert_tokens")
-				}
 			}
 
 			if let Repeat::AtLeast(_) = token.repeat {
@@ -168,38 +165,21 @@ impl Regex {
 		}
 	}
 
-	fn from_tokens(mut tokens: &[Box<Token>]) -> Self {
+	fn from_tokens(tokens: Tokens) -> Self {
 		let mut states = vec![State {
 			next: 0,
 			value: MatchValue::Match,
 		}];
+
 		let mut index = 0;
 
-		let beginning_boundary = matches!(
-			tokens.first().map(|x| x.value == MatchCharacter::Beginning),
-			Some(true),
-		);
-
-		if beginning_boundary {
-			tokens = &tokens[1..];
-		}
-
-		let end_boundary = matches!(
-			tokens.last().map(|x| x.value == MatchCharacter::End),
-			Some(true)
-		);
-
-		if end_boundary {
-			tokens = &tokens[..tokens.len() - 1];
-		}
-
-		Self::convert_tokens(&tokens, &mut states, &mut index);
+		Self::convert_tokens(&tokens.tokens, &mut states, &mut index);
 
 		Self {
 			head: index,
 			states,
-			beginning_boundary,
-			end_boundary,
+			beginning_boundary: tokens.beginning_boundary,
+			end_boundary: tokens.end_boundary,
 		}
 	}
 
@@ -220,8 +200,6 @@ impl Regex {
 			}
 
 			step.step(ch);
-
-			println!("{:?}", step);
 		}
 
 		step.matched
